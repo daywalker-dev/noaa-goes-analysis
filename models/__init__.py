@@ -1,9 +1,6 @@
 """Model architectures for all four training stages.
 
-Note: The actual module layout is FLAT (models/*.py), not nested
-(models/encoders/spatial_cnn.py). The README project structure shows
-the intended future layout, but the implemented files are:
-
+Module layout (flat):
     models/blocks.py            — ResidualBlock, Attention, CBAM, FiLM, etc.
     models/spatial_encoder.py   — SpatialCNNEncoder, DomainEncoderEnsemble
     models/temporal_bayesian.py — VariationalTransformer
