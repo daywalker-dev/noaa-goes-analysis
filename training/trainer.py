@@ -1,197 +1,550 @@
-"""Base trainer with mixed precision, gradient clipping, and checkpointing."""
+"""
+Multi-Stage Training Engine
+============================
+Implements the four-stage training pipeline:
+
+    Stage 1 — Spatial CNN encoders (land, sea, cloud)
+    Stage 2 — Temporal probabilistic model (encoders frozen)
+    Stage 3 — Reverse generator / conditional decoder
+    Stage 4 — Full fusion model
+
+Each stage handles its own optimizer, scheduler, loss, checkpointing,
+and mixed-precision context.
+"""
+
 from __future__ import annotations
 
 import logging
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
 from torch.utils.data import DataLoader
-from omegaconf import DictConfig
 
-from goes_forecast.training.callbacks import EarlyStopping, CheckpointManager, LRWarmup
+from models.blocks import CombinedLoss
+from utils.reproducibility import amp_context, EarlyStopping
 
 logger = logging.getLogger(__name__)
 
 
-class BaseTrainer:
-    """Base training loop with AMP, grad clipping, checkpointing, and logging.
+# ===========================================================================
+# Scheduler factory
+# ===========================================================================
 
-    Subclasses implement _train_step() and _val_step().
+def _build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    cfg: Dict[str, Any],
+    total_epochs: int,
+) -> Optional[torch.optim.lr_scheduler._LRScheduler]:
+    name = cfg.get("scheduler", "cosine")
+    if name == "cosine":
+        warmup = cfg.get("warmup_epochs", 0)
+        return CosineAnnealingLR(optimizer, T_max=total_epochs - warmup)
+    elif name == "step":
+        return StepLR(optimizer, step_size=cfg["step_size"], gamma=cfg["gamma"])
+    return None
+
+
+# ===========================================================================
+# Generic epoch runner
+# ===========================================================================
+
+def _run_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: Optional[torch.optim.Optimizer],
+    device: torch.device,
+    mixed_precision: bool,
+    scaler: Optional[torch.amp.GradScaler],
+    prepare_batch_fn: Any,
+    is_train: bool = True,
+) -> float:
+    """Run one epoch of training or validation.
+
+    *prepare_batch_fn* is a callable that receives a batch dict and device
+    and returns ``(model_input, target, mask, prev)`` tuples.
     """
+    model.train() if is_train else model.eval()
+    total_loss = 0.0
+    n = 0
 
-    def __init__(
-        self,
-        model: nn.Module,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
-        cfg: DictConfig,
-        stage_cfg: DictConfig,
-        output_dir: str | Path,
-        device: Optional[torch.device] = None,
-    ):
-        self.model = model
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.cfg = cfg
-        self.stage_cfg = stage_cfg
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ctx = torch.enable_grad() if is_train else torch.no_grad()
+    with ctx:
+        for batch in loader:
+            inputs, target, mask, prev = prepare_batch_fn(batch, device)
+            with torch.amp.autocast("cuda", enabled=mixed_precision and device.type == "cuda"):
+                pred = model(inputs)
+                loss = criterion(pred, target, mask, prev)
 
-        self.model.to(self.device)
+            if is_train and optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
 
-        # Optimizer
-        opt_cfg = stage_cfg.optimizer
-        OptimizerClass = getattr(torch.optim, opt_cfg.type)
-        self.optimizer = OptimizerClass(
-            [p for p in model.parameters() if p.requires_grad],
-            lr=opt_cfg.lr,
-            weight_decay=opt_cfg.get("weight_decay", 0),
+            total_loss += loss.item() * target.shape[0]
+            n += target.shape[0]
+
+    return total_loss / max(n, 1)
+
+
+# ===========================================================================
+# Stage 1 — Encoder Training
+# ===========================================================================
+
+def train_encoder(
+    encoder: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    cfg: Dict[str, Any],
+    device: torch.device,
+    tag: str = "encoder",
+) -> nn.Module:
+    """Train a single spatial CNN encoder."""
+    stage_cfg = cfg["training"]["stage_1_encoder"]
+    loss_cfg = stage_cfg.get("loss", {})
+
+    criterion = CombinedLoss(
+        mse_weight=loss_cfg.get("mse_weight", 1.0),
+        ssim_weight=loss_cfg.get("ssim_weight", 0.3),
+        physics_weight=loss_cfg.get("physics_weight", 0.0),
+    ).to(device)
+
+    encoder = encoder.to(device)
+    optimizer = AdamW(encoder.parameters(), lr=stage_cfg["lr"],
+                      weight_decay=stage_cfg.get("weight_decay", 1e-5))
+    scheduler = _build_scheduler(optimizer, stage_cfg, stage_cfg["epochs"])
+    scaler = torch.amp.GradScaler("cuda") if cfg["project"].get("mixed_precision") else None
+    stopper = EarlyStopping(patience=12)
+
+    ckpt_dir = Path(cfg["project"]["checkpoint_dir"]) / tag
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    def _prep(batch: Dict, dev: torch.device) -> Tuple:
+        # Use land/sea/cloud inputs depending on tag
+        key_in = f"{tag.split('_')[0]}_in"
+        key_tgt = f"{tag.split('_')[0]}_target"
+        x = batch.get(key_in, batch.get("land_in"))
+        # Collapse time into batch: (B, T, C, H, W) → (B*T, C, H, W)
+        B, T = x.shape[:2]
+        x = x.view(B * T, *x.shape[2:]).to(dev)
+        tgt = batch.get(key_tgt, batch.get("land_target"))
+        tgt = tgt[:, 0].to(dev)  # first future step
+        # Expand target to match encoder output channels
+        tgt = tgt[:, :x.shape[1]]  # trim channels if needed
+        mask = batch["mask_target"][:, 0:1].to(dev) if "mask_target" in batch else None
+        return x[:B], tgt, mask, None  # use last input frame
+
+    best_val = float("inf")
+    for epoch in range(stage_cfg["epochs"]):
+        t0 = time.time()
+        train_loss = _run_epoch(
+            _EncoderWrapper(encoder), train_loader, criterion,
+            optimizer, device, cfg["project"].get("mixed_precision", False),
+            scaler, _prep, is_train=True,
         )
-
-        # Scheduler
-        sched_cfg = stage_cfg.scheduler
-        SchedulerClass = getattr(torch.optim.lr_scheduler, sched_cfg.type)
-        sched_params = {k: v for k, v in dict(sched_cfg).items() if k != "type"}
-        self.scheduler = SchedulerClass(self.optimizer, **sched_params)
-
-        # AMP
-        self.use_amp = cfg.training.mixed_precision and self.device.type == "cuda"
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
-        self.amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-
-        # Gradient clipping
-        self.grad_clip = cfg.training.gradient_clip
-
-        # Callbacks
-        ckpt_cfg = cfg.training.checkpointing
-        self.checkpoint_mgr = CheckpointManager(
-            self.output_dir / "checkpoints",
-            save_top_k=ckpt_cfg.save_top_k,
-            monitor=ckpt_cfg.monitor,
-            mode=ckpt_cfg.mode,
+        val_loss = _run_epoch(
+            _EncoderWrapper(encoder), val_loader, criterion,
+            None, device, cfg["project"].get("mixed_precision", False),
+            None, _prep, is_train=False,
         )
-        es_cfg = cfg.training.early_stopping
-        self.early_stopping = EarlyStopping(
-            patience=es_cfg.patience,
-            min_delta=es_cfg.min_delta,
-            mode=ckpt_cfg.mode,
-        )
-        self.warmup = LRWarmup(self.optimizer, warmup_steps=100)
+        if scheduler:
+            scheduler.step()
 
-        self.epochs = stage_cfg.epochs
-        self.log_interval = cfg.training.logging.log_every_n_steps
-        self.global_step = 0
+        dt = time.time() - t0
+        logger.info("[%s] Epoch %03d  train=%.5f  val=%.5f  (%.1fs)",
+                     tag, epoch + 1, train_loss, val_loss, dt)
 
-    def _train_step(self, batch: dict) -> dict[str, torch.Tensor]:
-        """Implement in subclass. Returns dict of losses."""
-        raise NotImplementedError
+        if val_loss < best_val:
+            best_val = val_loss
+            torch.save(encoder.state_dict(), ckpt_dir / "best.pt")
 
-    def _val_step(self, batch: dict) -> dict[str, torch.Tensor]:
-        """Implement in subclass. Returns dict of losses."""
-        raise NotImplementedError
+        if stopper.step(val_loss):
+            logger.info("Early stopping at epoch %d", epoch + 1)
+            break
 
-    def _to_device(self, batch: dict) -> dict:
-        """Move batch tensors to device."""
-        return {
-            k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
-            for k, v in batch.items()
-        }
+    # Reload best weights
+    encoder.load_state_dict(torch.load(ckpt_dir / "best.pt", weights_only=True))
+    return encoder
 
-    def train_epoch(self, epoch: int) -> dict[str, float]:
-        """Run one training epoch."""
-        self.model.train()
-        epoch_losses: dict[str, list[float]] = {}
 
-        for step, batch in enumerate(self.train_loader):
-            batch = self._to_device(batch)
-            self.warmup.step()
+class _EncoderWrapper(nn.Module):
+    """Thin wrapper so the generic epoch runner gets spatial prediction output."""
+    def __init__(self, enc: nn.Module) -> None:
+        super().__init__()
+        self.enc = enc
 
-            with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-                losses = self._train_step(batch)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _, pred, _ = self.enc(x)
+        return pred
 
-            total_loss = losses["total"]
-            self.scaler.scale(total_loss).backward()
 
-            if self.grad_clip > 0:
-                self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+# ===========================================================================
+# Stage 2 — Temporal Model Training
+# ===========================================================================
 
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.optimizer.zero_grad(set_to_none=True)
-            self.global_step += 1
+def train_temporal(
+    temporal_model: nn.Module,
+    encoders: Dict[str, nn.Module],
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    cfg: Dict[str, Any],
+    device: torch.device,
+) -> nn.Module:
+    """Train the probabilistic temporal model with frozen encoders."""
+    stage_cfg = cfg["training"]["stage_2_temporal"]
 
-            for k, v in losses.items():
-                epoch_losses.setdefault(k, []).append(v.item() if torch.is_tensor(v) else v)
+    # Freeze encoders
+    if stage_cfg.get("freeze_encoders", True):
+        for enc in encoders.values():
+            enc.eval()
+            for p in enc.parameters():
+                p.requires_grad_(False)
 
-            if self.global_step % self.log_interval == 0:
-                loss_str = " | ".join(f"{k}: {v.item():.4f}" for k, v in losses.items() if torch.is_tensor(v))
-                logger.info(f"[Train] epoch={epoch} step={self.global_step} | {loss_str}")
+    temporal_model = temporal_model.to(device)
+    optimizer = AdamW(temporal_model.parameters(), lr=stage_cfg["lr"],
+                      weight_decay=stage_cfg.get("weight_decay", 1e-5))
+    scheduler = _build_scheduler(optimizer, stage_cfg, stage_cfg["epochs"])
+    scaler = torch.amp.GradScaler("cuda") if cfg["project"].get("mixed_precision") else None
+    stopper = EarlyStopping(patience=15)
 
-        return {k: sum(v) / len(v) for k, v in epoch_losses.items()}
+    kl_weight = cfg["temporal"].get("kl_weight", 0.001)
 
-    @torch.no_grad()
-    def validate(self, epoch: int) -> dict[str, float]:
-        """Run validation."""
-        self.model.eval()
-        epoch_losses: dict[str, list[float]] = {}
+    ckpt_dir = Path(cfg["project"]["checkpoint_dir"]) / "temporal"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    best_val = float("inf")
 
-        for batch in self.val_loader:
-            batch = self._to_device(batch)
-            with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-                losses = self._val_step(batch)
+    for epoch in range(stage_cfg["epochs"]):
+        temporal_model.train()
+        total_loss, n = 0.0, 0
+        for batch in train_loader:
+            # Encode each group
+            latents = []
+            for key in ["land", "sea", "cloud"]:
+                enc = encoders.get(key)
+                if enc is None:
+                    continue
+                x = batch[f"{key}_in"].to(device)
+                B, T = x.shape[:2]
+                x_flat = x.view(B * T, *x.shape[2:])
+                with torch.no_grad():
+                    z, _, _ = enc(x_flat)
+                z = z.view(B, T, -1)
+                latents.append(z)
 
-            for k, v in losses.items():
-                epoch_losses.setdefault(k, []).append(v.item() if torch.is_tensor(v) else v)
+            # Append auxiliary features (flattened spatially)
+            for aux_key in ["wind_in", "thermo_in"]:
+                a = batch[aux_key].to(device)
+                B, T = a.shape[:2]
+                a_flat = a.view(B, T, -1)[:, :, :32]  # truncate to manageable size
+                latents.append(a_flat)
 
-        avg = {k: sum(v) / len(v) for k, v in epoch_losses.items()}
-        loss_str = " | ".join(f"{k}: {v:.4f}" for k, v in avg.items())
-        logger.info(f"[Val] epoch={epoch} | {loss_str}")
-        return avg
+            x_seq = torch.cat(latents, dim=-1)  # (B, T, D)
 
-    def fit(self) -> None:
-        """Full training loop."""
-        logger.info(f"Starting training: {self.epochs} epochs, device={self.device}")
-        start_time = time.time()
+            # Pad/truncate to expected input_dim
+            D = cfg["temporal"]["input_dim"]
+            if x_seq.shape[-1] < D:
+                pad = torch.zeros(*x_seq.shape[:2], D - x_seq.shape[-1], device=device)
+                x_seq = torch.cat([x_seq, pad], dim=-1)
+            else:
+                x_seq = x_seq[:, :, :D]
 
-        for epoch in range(1, self.epochs + 1):
-            epoch_start = time.time()
+            with torch.amp.autocast("cuda", enabled=cfg["project"].get("mixed_precision", False)):
+                out = temporal_model(x_seq)
+                recon_loss = nn.functional.mse_loss(out["pred_mu"], x_seq)
+                kl = out["kl_loss"]
+                loss = recon_loss + kl_weight * kl
 
-            train_losses = self.train_epoch(epoch)
-            val_losses = self.validate(epoch)
+            optimizer.zero_grad(set_to_none=True)
+            if scaler:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
 
-            self.scheduler.step()
+            total_loss += loss.item() * B
+            n += B
 
-            # Checkpoint
-            monitor_key = self.cfg.training.checkpointing.monitor.split("/")[-1]
-            val_metric = val_losses.get(monitor_key, val_losses.get("total", 0))
-            self.checkpoint_mgr.save(
-                self.model.state_dict(), val_metric, epoch,
-                extra={"optimizer": self.optimizer.state_dict()},
-            )
+        if scheduler:
+            scheduler.step()
 
-            # Early stopping
-            if self.early_stopping(val_metric):
-                break
+        epoch_loss = total_loss / max(n, 1)
+        logger.info("[temporal] Epoch %03d  loss=%.5f", epoch + 1, epoch_loss)
 
-            elapsed = time.time() - epoch_start
-            logger.info(
-                f"Epoch {epoch}/{self.epochs} done in {elapsed:.1f}s | "
-                f"train_loss={train_losses.get('total', 0):.4f} "
-                f"val_loss={val_losses.get('total', 0):.4f}"
-            )
+        if epoch_loss < best_val:
+            best_val = epoch_loss
+            torch.save(temporal_model.state_dict(), ckpt_dir / "best.pt")
 
-        total_time = time.time() - start_time
-        logger.info(f"Training complete in {total_time / 60:.1f} minutes")
+        if stopper.step(epoch_loss):
+            logger.info("Early stopping temporal at epoch %d", epoch + 1)
+            break
 
-    def load_checkpoint(self, path: str | Path) -> None:
-        """Load model and optimizer from checkpoint."""
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(ckpt["state_dict"])
-        if "optimizer" in ckpt:
-            self.optimizer.load_state_dict(ckpt["optimizer"])
-        logger.info(f"Loaded checkpoint from {path} (epoch {ckpt.get('epoch', '?')})")
+    temporal_model.load_state_dict(torch.load(ckpt_dir / "best.pt", weights_only=True))
+    return temporal_model
+
+
+# ===========================================================================
+# Stage 3 — Decoder Training
+# ===========================================================================
+
+def train_decoder(
+    decoder: nn.Module,
+    temporal_model: nn.Module,
+    encoders: Dict[str, nn.Module],
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    cfg: Dict[str, Any],
+    device: torch.device,
+) -> nn.Module:
+    """Train the reverse generator conditioned on temporal model outputs."""
+    stage_cfg = cfg["training"]["stage_3_decoder"]
+
+    decoder = decoder.to(device)
+    temporal_model.eval()
+    for p in temporal_model.parameters():
+        p.requires_grad_(False)
+
+    optimizer = AdamW(decoder.parameters(), lr=stage_cfg["lr"],
+                      weight_decay=stage_cfg.get("weight_decay", 1e-5))
+    scheduler = _build_scheduler(optimizer, stage_cfg, stage_cfg["epochs"])
+    scaler = torch.amp.GradScaler("cuda") if cfg["project"].get("mixed_precision") else None
+    stopper = EarlyStopping(patience=10)
+
+    criterion = CombinedLoss(mse_weight=1.0, ssim_weight=0.3).to(device)
+
+    ckpt_dir = Path(cfg["project"]["checkpoint_dir"]) / "decoder"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    best_val = float("inf")
+
+    for epoch in range(stage_cfg["epochs"]):
+        decoder.train()
+        total_loss, n = 0.0, 0
+
+        for batch in train_loader:
+            # Get temporal latent
+            latents = []
+            for key in ["land", "sea", "cloud"]:
+                enc = encoders.get(key)
+                if enc is None:
+                    continue
+                x = batch[f"{key}_in"].to(device)
+                B, T = x.shape[:2]
+                x_flat = x.view(B * T, *x.shape[2:])
+                with torch.no_grad():
+                    z, _, _ = enc(x_flat)
+                z = z.view(B, T, -1)
+                latents.append(z)
+
+            x_seq = torch.cat(latents, dim=-1)
+            D = cfg["temporal"]["input_dim"]
+            if x_seq.shape[-1] < D:
+                pad = torch.zeros(*x_seq.shape[:2], D - x_seq.shape[-1], device=device)
+                x_seq = torch.cat([x_seq, pad], dim=-1)
+            else:
+                x_seq = x_seq[:, :, :D]
+
+            with torch.no_grad():
+                temp_out = temporal_model(x_seq)
+            z_pred = temp_out["pred_mu"][:, -1]  # last-step prediction
+
+            # Truncate to decoder input dim
+            dec_dim = cfg["decoder"]["in_channels"]
+            z_dec = z_pred[:, :dec_dim]
+
+            # Target: all available L2 channels stacked
+            targets = []
+            for key in ["land_target", "sea_target", "cloud_target"]:
+                t = batch[key][:, 0].to(device)  # first future step
+                targets.append(t)
+            target = torch.cat(targets, dim=1)
+
+            # Trim to decoder output channels
+            out_ch = cfg["decoder"]["out_channels"]
+            target = target[:, :out_ch]
+
+            with torch.amp.autocast("cuda", enabled=cfg["project"].get("mixed_precision", False)):
+                recon = decoder(z_dec)
+                loss = criterion(recon, target)
+
+            optimizer.zero_grad(set_to_none=True)
+            if scaler:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+
+            total_loss += loss.item() * z_dec.shape[0]
+            n += z_dec.shape[0]
+
+        if scheduler:
+            scheduler.step()
+
+        epoch_loss = total_loss / max(n, 1)
+        logger.info("[decoder] Epoch %03d  loss=%.5f", epoch + 1, epoch_loss)
+
+        if epoch_loss < best_val:
+            best_val = epoch_loss
+            torch.save(decoder.state_dict(), ckpt_dir / "best.pt")
+
+        if stopper.step(epoch_loss):
+            break
+
+    decoder.load_state_dict(torch.load(ckpt_dir / "best.pt", weights_only=True))
+    return decoder
+
+
+# ===========================================================================
+# Stage 4 — Fusion Training
+# ===========================================================================
+
+def train_fusion(
+    fusion_model: nn.Module,
+    decoder: nn.Module,
+    temporal_model: nn.Module,
+    encoders: Dict[str, nn.Module],
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    cfg: Dict[str, Any],
+    device: torch.device,
+) -> nn.Module:
+    """Train the full fusion model combining all streams."""
+    stage_cfg = cfg["training"]["stage_4_fusion"]
+
+    fusion_model = fusion_model.to(device)
+    # Freeze upstream
+    for m in [temporal_model, decoder, *encoders.values()]:
+        m.eval()
+        for p in m.parameters():
+            p.requires_grad_(False)
+
+    optimizer = AdamW(fusion_model.parameters(), lr=stage_cfg["lr"],
+                      weight_decay=stage_cfg.get("weight_decay", 1e-5))
+    scheduler = _build_scheduler(optimizer, stage_cfg, stage_cfg["epochs"])
+    scaler = torch.amp.GradScaler("cuda") if cfg["project"].get("mixed_precision") else None
+    stopper = EarlyStopping(patience=10)
+    criterion = CombinedLoss(mse_weight=1.0, ssim_weight=0.2).to(device)
+
+    ckpt_dir = Path(cfg["project"]["checkpoint_dir"]) / "fusion"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    best_val = float("inf")
+    hidden_dim = cfg["fusion"]["hidden_dim"]
+
+    for epoch in range(stage_cfg["epochs"]):
+        fusion_model.train()
+        total_loss, n = 0.0, 0
+
+        for batch in train_loader:
+            sources = []
+
+            # Source 1: original L2 (global avg pool → vector)
+            orig_fields = []
+            for key in ["land_in", "sea_in", "cloud_in"]:
+                f = batch[key][:, -1].to(device)  # last input frame
+                orig_fields.append(f)
+            orig = torch.cat(orig_fields, dim=1)
+            orig_vec = orig.mean(dim=(-2, -1))  # (B, C_total)
+            # Project to hidden_dim
+            if not hasattr(train_fusion, "_orig_proj"):
+                train_fusion._orig_proj = nn.Linear(orig_vec.shape[-1], hidden_dim).to(device)
+            sources.append(train_fusion._orig_proj(orig_vec))
+
+            # Source 2: CNN encoder predictions
+            enc_preds = []
+            for key in ["land", "sea", "cloud"]:
+                enc = encoders.get(key)
+                if enc is None:
+                    continue
+                x = batch[f"{key}_in"][:, -1].to(device)
+                with torch.no_grad():
+                    z, pred, _ = enc(x)
+                enc_preds.append(z)
+            enc_cat = torch.cat(enc_preds, dim=-1) if enc_preds else torch.zeros(orig.shape[0], hidden_dim, device=device)
+            if not hasattr(train_fusion, "_enc_proj"):
+                train_fusion._enc_proj = nn.Linear(enc_cat.shape[-1], hidden_dim).to(device)
+            sources.append(train_fusion._enc_proj(enc_cat))
+
+            # Source 3: temporal model output
+            latents = []
+            for key in ["land", "sea", "cloud"]:
+                enc = encoders.get(key)
+                if enc is None:
+                    continue
+                x = batch[f"{key}_in"].to(device)
+                B, T = x.shape[:2]
+                x_flat = x.view(B * T, *x.shape[2:])
+                with torch.no_grad():
+                    z, _, _ = enc(x_flat)
+                z = z.view(B, T, -1)
+                latents.append(z)
+            x_seq = torch.cat(latents, dim=-1)
+            D = cfg["temporal"]["input_dim"]
+            if x_seq.shape[-1] < D:
+                pad = torch.zeros(*x_seq.shape[:2], D - x_seq.shape[-1], device=device)
+                x_seq = torch.cat([x_seq, pad], dim=-1)
+            else:
+                x_seq = x_seq[:, :, :D]
+            with torch.no_grad():
+                temp_out = temporal_model(x_seq)
+            temp_vec = temp_out["pred_mu"][:, -1, :hidden_dim]
+            if temp_vec.shape[-1] < hidden_dim:
+                temp_vec = F.pad(temp_vec, (0, hidden_dim - temp_vec.shape[-1]))
+            sources.append(temp_vec)
+
+            # Source 4: wind + humidity aux
+            wind = batch["wind_in"][:, -1].to(device).mean(dim=(-2, -1))
+            thermo = batch["thermo_in"][:, -1].to(device).mean(dim=(-2, -1))
+            aux = torch.cat([wind, thermo], dim=-1)
+            if not hasattr(train_fusion, "_aux_proj"):
+                train_fusion._aux_proj = nn.Linear(aux.shape[-1], hidden_dim).to(device)
+            sources.append(train_fusion._aux_proj(aux))
+
+            # Target
+            targets = []
+            for key in ["land_target", "sea_target", "cloud_target"]:
+                targets.append(batch[key][:, 0].to(device))
+            target = torch.cat(targets, dim=1)[:, :cfg["fusion"]["output_dim"]]
+
+            with torch.amp.autocast("cuda", enabled=cfg["project"].get("mixed_precision", False)):
+                out = fusion_model(sources)
+                loss = criterion(out, target)
+
+            optimizer.zero_grad(set_to_none=True)
+            if scaler:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+
+            total_loss += loss.item() * target.shape[0]
+            n += target.shape[0]
+
+        if scheduler:
+            scheduler.step()
+
+        epoch_loss = total_loss / max(n, 1)
+        logger.info("[fusion] Epoch %03d  loss=%.5f", epoch + 1, epoch_loss)
+
+        if epoch_loss < best_val:
+            best_val = epoch_loss
+            torch.save(fusion_model.state_dict(), ckpt_dir / "best.pt")
+
+        if stopper.step(epoch_loss):
+            break
+
+    fusion_model.load_state_dict(torch.load(ckpt_dir / "best.pt", weights_only=True))
+    return fusion_model

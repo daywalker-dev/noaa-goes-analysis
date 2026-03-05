@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from goes_forecast.models.blocks import SinusoidalPE
+from models.blocks import SinusoidalPE
 
 
 class MeteoProjector(nn.Module):

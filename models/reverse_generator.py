@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from goes_forecast.models.blocks import ResidualBlock, FiLM
+from models.blocks import ResidualBlock, FiLM
 
 
 class ConditionalUNet(nn.Module):

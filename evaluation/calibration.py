@@ -86,7 +86,7 @@ def calibration_summary(
     confidence_levels: list[float] = (0.5, 0.8, 0.9, 0.95),
 ) -> dict[str, dict[str, float]]:
     """Compute calibration summary: nominal vs actual coverage at each level."""
-    from goes_forecast.evaluation.metrics import coverage_score
+    from evaluation.metrics import coverage_score
 
     results = {}
     for cl in confidence_levels:

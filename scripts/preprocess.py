@@ -2,9 +2,9 @@
 """Run the full preprocessing pipeline: raw NetCDF → Zarr store."""
 import click
 from pathlib import Path
-from goes_forecast.utils.config_loader import load_config
-from goes_forecast.utils.logger import get_logger
-from goes_forecast.data.preprocessor import GOESPreprocessor
+from utils.config_loader import load_config
+from utils.logger import get_logger
+from data.preprocessor import GOESPreprocessor
 
 logger = get_logger(__name__)
 

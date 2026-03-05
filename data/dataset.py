@@ -10,8 +10,8 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from omegaconf import DictConfig
 
-from goes_forecast.data.zarr_store import ZarrStore
-from goes_forecast.data.augmentation import build_augmentation
+from data.zarr_store import ZarrStore
+from data.augmentation import build_augmentation
 
 logger = logging.getLogger(__name__)
 

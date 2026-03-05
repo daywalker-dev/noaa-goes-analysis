@@ -11,7 +11,7 @@ import xarray as xr
 from omegaconf import DictConfig
 from scipy.ndimage import distance_transform_edt
 
-from goes_forecast.utils.projection import (
+from utils.projection import (
     compute_grid_coords,
     goes_fixed_grid_to_latlon,
     make_target_area,

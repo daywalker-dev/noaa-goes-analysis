@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from goes_forecast.models.blocks import DownBlock, UpBlock, ResidualBlock, CBAM
+from models.blocks import DownBlock, UpBlock, ResidualBlock, CBAM
 
 
 class SpatialCNNEncoder(nn.Module):

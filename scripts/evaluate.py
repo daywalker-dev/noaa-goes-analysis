@@ -11,22 +11,22 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from goes_forecast.utils.config_loader import load_config
-from goes_forecast.utils.logger import get_logger
-from goes_forecast.utils.reproducibility import set_global_seed
-from goes_forecast.data.dataset import build_dataloader
-from goes_forecast.models.spatial_encoder import DomainEncoderEnsemble
-from goes_forecast.models.temporal_bayesian import VariationalTransformer
-from goes_forecast.models.reverse_generator import ConditionalUNet
-from goes_forecast.models.fusion import FusionTransformer
-from goes_forecast.evaluation.metrics import (
+from utils.config_loader import load_config
+from utils.logger import get_logger
+from utils.reproducibility import set_global_seed
+from data.dataset import build_dataloader
+from models.spatial_encoder import DomainEncoderEnsemble
+from models.temporal_bayesian import VariationalTransformer
+from models.reverse_generator import ConditionalUNet
+from models.fusion import FusionTransformer
+from evaluation.metrics import (
     rmse, mae, bias, ssim_score, spatial_correlation,
     crps_gaussian, coverage_score, multistep_skill, get_metric,
 )
-from goes_forecast.evaluation.calibration import (
+from evaluation.calibration import (
     reliability_diagram, calibration_summary, rank_histogram, sharpness,
 )
-from goes_forecast.evaluation.visualizer import (
+from evaluation.visualizer import (
     plot_forecast_map, plot_uncertainty_bands,
     plot_skill_curves, plot_reliability_diagram, plot_spatial_error,
 )

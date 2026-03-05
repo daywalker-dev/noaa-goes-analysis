@@ -3,10 +3,10 @@ import pytest
 import torch
 from types import SimpleNamespace
 
-from goes_forecast.models.spatial_encoder import SpatialCNNEncoder, DomainEncoderEnsemble
-from goes_forecast.models.temporal_bayesian import VariationalTransformer
-from goes_forecast.models.reverse_generator import ConditionalUNet
-from goes_forecast.models.fusion import FusionTransformer
+from models.spatial_encoder import SpatialCNNEncoder, DomainEncoderEnsemble
+from models.temporal_bayesian import VariationalTransformer
+from models.reverse_generator import ConditionalUNet
+from models.fusion import FusionTransformer
 
 
 def _make_encoder_cfg(**overrides):

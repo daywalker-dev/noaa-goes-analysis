@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from goes_forecast.evaluation.calibration import (
+from evaluation.calibration import (
     reliability_diagram, rank_histogram, sharpness, calibration_summary,
 )
 

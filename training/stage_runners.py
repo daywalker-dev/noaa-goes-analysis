@@ -10,8 +10,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from omegaconf import DictConfig
 
-from goes_forecast.training.trainer import BaseTrainer
-from goes_forecast.training.losses import (
+from training.trainer import BaseTrainer
+from training.losses import (
     MaskedMSE, SSIMLoss, CRPSLoss, SpectralLoss,
     PhysicsConstraintLoss, ELBOLoss,
 )

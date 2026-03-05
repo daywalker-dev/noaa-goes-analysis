@@ -1,197 +1,308 @@
-"""Evaluation metrics for deterministic, probabilistic, and spatial forecast quality."""
+"""
+Evaluation Suite
+=================
+Comprehensive metrics for deterministic and probabilistic forecast evaluation.
+
+Metrics:
+    - RMSE / MAE
+    - SSIM
+    - CRPS (Continuous Ranked Probability Score)
+    - Calibration curves
+    - Spatial correlation
+    - Multi-step degradation analysis
+"""
+
 from __future__ import annotations
 
-import math
-from typing import Optional
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from scipy import stats as sp_stats
+import torch
+import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 
-def rmse(
-    pred: np.ndarray,
-    target: np.ndarray,
-    mask: Optional[np.ndarray] = None,
-) -> float:
-    """Root mean squared error."""
-    diff = (pred - target) ** 2
+# ===========================================================================
+# Deterministic Metrics
+# ===========================================================================
+
+def rmse(pred: np.ndarray, target: np.ndarray, mask: Optional[np.ndarray] = None) -> float:
+    """Root Mean Squared Error over valid pixels."""
     if mask is not None:
-        diff = diff[mask > 0]
-    return float(np.sqrt(np.nanmean(diff)))
+        pred, target = pred[mask], target[mask]
+    return float(np.sqrt(np.mean((pred - target) ** 2)))
 
 
-def mae(
-    pred: np.ndarray,
-    target: np.ndarray,
-    mask: Optional[np.ndarray] = None,
-) -> float:
-    """Mean absolute error."""
-    diff = np.abs(pred - target)
+def mae(pred: np.ndarray, target: np.ndarray, mask: Optional[np.ndarray] = None) -> float:
+    """Mean Absolute Error over valid pixels."""
     if mask is not None:
-        diff = diff[mask > 0]
-    return float(np.nanmean(diff))
+        pred, target = pred[mask], target[mask]
+    return float(np.mean(np.abs(pred - target)))
 
 
-def bias(
-    pred: np.ndarray,
-    target: np.ndarray,
-    mask: Optional[np.ndarray] = None,
+def ssim_metric(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    window_size: int = 11,
 ) -> float:
-    """Mean bias (pred - target)."""
-    diff = pred - target
-    if mask is not None:
-        diff = diff[mask > 0]
-    return float(np.nanmean(diff))
-
-
-def ssim_score(
-    pred: np.ndarray,
-    target: np.ndarray,
-    data_range: float = 1.0,
-    win_size: int = 7,
-) -> float:
-    """Structural similarity index (simplified implementation).
-
-    Args:
-        pred, target: 2D arrays (H, W) or 3D (C, H, W).
-        data_range: Dynamic range of the data.
-        win_size: Window size for local statistics.
-    """
-    from scipy.ndimage import uniform_filter
-
-    C1 = (0.01 * data_range) ** 2
-    C2 = (0.03 * data_range) ** 2
-
-    pred = pred.astype(np.float64)
-    target = target.astype(np.float64)
-
-    mu_x = uniform_filter(pred, size=win_size)
-    mu_y = uniform_filter(target, size=win_size)
-
-    sigma_x_sq = uniform_filter(pred ** 2, size=win_size) - mu_x ** 2
-    sigma_y_sq = uniform_filter(target ** 2, size=win_size) - mu_y ** 2
-    sigma_xy = uniform_filter(pred * target, size=win_size) - mu_x * mu_y
-
-    ssim_map = ((2 * mu_x * mu_y + C1) * (2 * sigma_xy + C2)) / (
-        (mu_x ** 2 + mu_y ** 2 + C1) * (sigma_x_sq + sigma_y_sq + C2)
-    )
-    return float(np.nanmean(ssim_map))
+    """Compute mean SSIM (higher is better). Input: (B, C, H, W) tensors."""
+    from models.blocks import ssim_loss
+    # ssim_loss returns 1 - SSIM
+    return float(1.0 - ssim_loss(pred, target, window_size))
 
 
 def spatial_correlation(pred: np.ndarray, target: np.ndarray) -> float:
-    """Anomaly correlation coefficient (ACC).
+    """Pearson correlation computed over spatial dims.
 
-    Measures spatial pattern similarity after removing the mean.
+    Input: (H, W) or (C, H, W) arrays.  Returns mean correlation across channels.
     """
-    pred_anom = pred - np.nanmean(pred)
-    target_anom = target - np.nanmean(target)
-    num = np.nansum(pred_anom * target_anom)
-    denom = np.sqrt(np.nansum(pred_anom ** 2) * np.nansum(target_anom ** 2))
-    if denom < 1e-10:
-        return 0.0
-    return float(num / denom)
+    if pred.ndim == 2:
+        pred = pred[np.newaxis]
+        target = target[np.newaxis]
 
+    corrs = []
+    for c in range(pred.shape[0]):
+        p = pred[c].ravel()
+        t = target[c].ravel()
+        valid = np.isfinite(p) & np.isfinite(t)
+        if valid.sum() < 2:
+            continue
+        p, t = p[valid], t[valid]
+        r = np.corrcoef(p, t)[0, 1]
+        if np.isfinite(r):
+            corrs.append(r)
+    return float(np.mean(corrs)) if corrs else 0.0
+
+
+# ===========================================================================
+# Probabilistic Metrics
+# ===========================================================================
 
 def crps_gaussian(
     mu: np.ndarray,
     sigma: np.ndarray,
-    target: np.ndarray,
+    obs: np.ndarray,
 ) -> float:
-    """Closed-form CRPS for Gaussian distribution N(mu, sigma^2).
+    """Continuous Ranked Probability Score for Gaussian forecasts.
 
-    CRPS = σ [y_norm (2Φ(y_norm) - 1) + 2φ(y_norm) - 1/√π]
+    Closed-form for N(mu, sigma²):
+        CRPS = sigma * [ z*Phi(z) + phi(z) - 1/sqrt(pi) ]
+    where z = (obs - mu) / sigma.
     """
-    sigma = np.maximum(sigma, 1e-6)
-    y_norm = (target - mu) / sigma
-    phi = sp_stats.norm.pdf(y_norm)
-    Phi = sp_stats.norm.cdf(y_norm)
-    crps_vals = sigma * (y_norm * (2 * Phi - 1) + 2 * phi - 1.0 / math.sqrt(math.pi))
-    return float(np.nanmean(crps_vals))
+    from scipy.stats import norm
+
+    sigma = np.clip(sigma, 1e-6, None)
+    z = (obs - mu) / sigma
+    crps_values = sigma * (
+        z * (2 * norm.cdf(z) - 1)
+        + 2 * norm.pdf(z)
+        - 1.0 / np.sqrt(np.pi)
+    )
+    return float(np.mean(crps_values))
 
 
-def crps_ensemble(samples: np.ndarray, target: np.ndarray) -> float:
-    """CRPS estimated from ensemble samples using energy form.
+def crps_ensemble(
+    samples: np.ndarray,
+    obs: np.ndarray,
+) -> float:
+    """CRPS from ensemble samples using the PWM estimator.
 
-    Args:
-        samples: (N, ...) ensemble of N samples.
-        target: (...) observations.
+    Parameters
+    ----------
+    samples : (num_samples, ...) — ensemble forecasts
+    obs     : (...) — observations (same trailing shape)
     """
-    N = samples.shape[0]
-    # E|X - y|
-    term1 = np.nanmean(np.abs(samples - target[None]), axis=0)
-    # E|X - X'| / 2
-    term2 = 0.0
-    for i in range(N):
-        for j in range(i + 1, N):
-            term2 = term2 + np.nanmean(np.abs(samples[i] - samples[j]))
-    term2 = term2 / (N * (N - 1) / 2) / 2 if N > 1 else 0.0
-    return float(np.nanmean(term1) - term2)
+    S = samples.shape[0]
+    # Term 1: E|X - y|
+    term1 = np.mean(np.abs(samples - obs[np.newaxis]), axis=0)
+    # Term 2: E|X - X'| / 2
+    term2 = np.zeros_like(term1)
+    for i in range(S):
+        for j in range(i + 1, S):
+            term2 += np.abs(samples[i] - samples[j])
+    term2 /= (S * (S - 1) / 2) if S > 1 else 1.0
+    return float(np.mean(term1 - 0.5 * term2))
 
 
-def coverage_score(
+# ===========================================================================
+# Calibration
+# ===========================================================================
+
+def calibration_curve(
     mu: np.ndarray,
     sigma: np.ndarray,
-    target: np.ndarray,
-    confidence: float = 0.9,
-) -> float:
-    """Fraction of observations falling within the CI.
+    obs: np.ndarray,
+    num_bins: int = 20,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute reliability diagram data for probabilistic calibration.
 
-    Args:
-        mu, sigma: Predicted mean and std.
-        target: Observed values.
-        confidence: Confidence level (e.g. 0.9 for 90% CI).
+    Returns (expected_freq, observed_freq) arrays of shape (num_bins,).
+    A well-calibrated model has observed_freq ≈ expected_freq.
     """
-    z = sp_stats.norm.ppf(0.5 + confidence / 2)
-    lower = mu - z * sigma
-    upper = mu + z * sigma
-    in_interval = (target >= lower) & (target <= upper)
-    return float(np.nanmean(in_interval))
+    from scipy.stats import norm
+
+    sigma = np.clip(sigma, 1e-6, None)
+    cdf_values = norm.cdf(obs, loc=mu, scale=sigma).ravel()
+
+    bin_edges = np.linspace(0, 1, num_bins + 1)
+    expected = np.zeros(num_bins)
+    observed = np.zeros(num_bins)
+
+    for i in range(num_bins):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        mask = (cdf_values >= lo) & (cdf_values < hi)
+        expected[i] = (lo + hi) / 2.0
+        observed[i] = mask.mean() if mask.any() else 0.0
+
+    return expected, observed
 
 
-def multistep_skill(
-    pred_sequence: np.ndarray,
-    target_sequence: np.ndarray,
-    metric_fn,
-    lead_times: Optional[list[int]] = None,
-) -> dict[int, float]:
-    """Compute a metric at each lead time.
+# ===========================================================================
+# Multi-step Degradation Analysis
+# ===========================================================================
 
-    Args:
-        pred_sequence: (T, ...) predictions at each forecast step.
-        target_sequence: (T, ...) observations at each step.
-        metric_fn: Callable(pred, target) → float.
-        lead_times: Specific lead times to evaluate (1-indexed). None = all.
+def multistep_degradation(
+    model_forecast_fn,
+    init_state: torch.Tensor,
+    targets: List[torch.Tensor],
+    horizons: List[int],
+    device: torch.device,
+) -> Dict[int, Dict[str, float]]:
+    """Evaluate forecast quality at each horizon step.
 
-    Returns:
-        {lead_time: metric_value}
+    Parameters
+    ----------
+    model_forecast_fn : callable
+        ``(state, steps) -> dict(mean, std)``
+    init_state : (B, D)
+    targets : list of (B, D) tensors, one per future step
+    horizons : list of int step indices to evaluate
+
+    Returns
+    -------
+    dict mapping horizon → {rmse, mae, spatial_corr}
     """
-    T = pred_sequence.shape[0]
-    if lead_times is None:
-        lead_times = list(range(1, T + 1))
+    results: Dict[int, Dict[str, float]] = {}
+    max_h = max(horizons)
+    forecast = model_forecast_fn(init_state.to(device), max_h)
+    pred_mean = forecast["mean"].cpu().numpy()  # (B, steps, D)
 
-    results = {}
-    for lt in lead_times:
-        if lt <= T:
-            results[lt] = metric_fn(pred_sequence[lt - 1], target_sequence[lt - 1])
+    for h in horizons:
+        if h > len(targets):
+            continue
+        t_np = targets[h - 1].cpu().numpy()
+        p_np = pred_mean[:, h - 1]
+        results[h] = {
+            "rmse": rmse(p_np, t_np),
+            "mae": mae(p_np, t_np),
+        }
     return results
 
 
-# ---------------------------------------------------------------------------
-# Metric registry for config-driven evaluation
-# ---------------------------------------------------------------------------
-METRIC_REGISTRY = {
-    "rmse": rmse,
-    "mae": mae,
-    "bias": bias,
-    "ssim": ssim_score,
-    "spatial_correlation": spatial_correlation,
-    "crps_gaussian": crps_gaussian,
-    "coverage": coverage_score,
-}
+# ===========================================================================
+# Full Evaluation Pipeline
+# ===========================================================================
+
+def run_evaluation(
+    predictions: Dict[str, np.ndarray],
+    targets: Dict[str, np.ndarray],
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Run all configured metrics and return a results dictionary.
+
+    Parameters
+    ----------
+    predictions : dict with keys "mean", "std", "samples" (optional)
+    targets : dict with key "obs"
+    cfg : full project config
+
+    Returns
+    -------
+    dict of metric name → value
+    """
+    eval_cfg = cfg.get("evaluation", {})
+    metrics_list = eval_cfg.get("metrics", ["rmse", "mae"])
+    results: Dict[str, Any] = {}
+
+    pred_mu = predictions["mean"]
+    obs = targets["obs"]
+
+    if "rmse" in metrics_list:
+        results["rmse"] = rmse(pred_mu, obs)
+    if "mae" in metrics_list:
+        results["mae"] = mae(pred_mu, obs)
+    if "ssim" in metrics_list:
+        # Convert to torch for SSIM
+        p_t = torch.from_numpy(pred_mu).float()
+        o_t = torch.from_numpy(obs).float()
+        if p_t.ndim == 3:
+            p_t = p_t.unsqueeze(0)
+            o_t = o_t.unsqueeze(0)
+        results["ssim"] = ssim_metric(p_t, o_t)
+    if "spatial_correlation" in metrics_list:
+        results["spatial_correlation"] = spatial_correlation(pred_mu, obs)
+    if "crps" in metrics_list and "std" in predictions:
+        results["crps"] = crps_gaussian(pred_mu, predictions["std"], obs)
+
+    # Calibration
+    if "std" in predictions:
+        num_bins = eval_cfg.get("calibration", {}).get("num_bins", 20)
+        expected, observed = calibration_curve(
+            pred_mu, predictions["std"], obs, num_bins
+        )
+        results["calibration"] = {"expected": expected.tolist(), "observed": observed.tolist()}
+
+    logger.info("Evaluation results: %s",
+                {k: v for k, v in results.items() if k != "calibration"})
+    return results
 
 
-def get_metric(name: str):
-    """Retrieve metric function by name."""
-    if name not in METRIC_REGISTRY:
-        raise ValueError(f"Unknown metric '{name}'. Available: {list(METRIC_REGISTRY.keys())}")
-    return METRIC_REGISTRY[name]
+# ===========================================================================
+# Optional: save evaluation plots
+# ===========================================================================
+
+def save_evaluation_plots(
+    results: Dict[str, Any],
+    plot_dir: str | Path,
+) -> None:
+    """Generate and save evaluation plots (requires matplotlib)."""
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        logger.warning("matplotlib not installed — skipping plot generation")
+        return
+
+    plot_dir = Path(plot_dir)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    # Calibration plot
+    cal = results.get("calibration")
+    if cal:
+        fig, ax = plt.subplots(figsize=(5, 5))
+        ax.plot(cal["expected"], cal["observed"], "o-", label="Model")
+        ax.plot([0, 1], [0, 1], "--k", label="Perfect")
+        ax.set_xlabel("Expected CDF")
+        ax.set_ylabel("Observed frequency")
+        ax.set_title("Calibration Curve")
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(plot_dir / "calibration.png", dpi=150)
+        plt.close(fig)
+        logger.info("Saved calibration plot → %s", plot_dir / "calibration.png")
+
+    # Bar chart of scalar metrics
+    scalar = {k: v for k, v in results.items() if isinstance(v, (int, float))}
+    if scalar:
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.bar(scalar.keys(), scalar.values())
+        ax.set_ylabel("Metric value")
+        ax.set_title("Evaluation Metrics")
+        fig.tight_layout()
+        fig.savefig(plot_dir / "metrics_summary.png", dpi=150)
+        plt.close(fig)

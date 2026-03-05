@@ -1,0 +1,164 @@
+# ===========================================================================
+# GOES L2 Probabilistic Forecasting — Master Configuration
+# ===========================================================================
+
+project:
+  name: "goes_l2_forecast"
+  seed: 42
+  device: "cuda"
+  mixed_precision: true
+  num_workers: 4
+  log_dir: "runs/"
+  checkpoint_dir: "checkpoints/"
+
+# ---------------------------------------------------------------------------
+# DATA
+# ---------------------------------------------------------------------------
+data:
+  satellite: "goes16"
+  domain: "C"               # C=CONUS, F=FullDisk, M1/M2=Mesoscale
+  products:
+    - "ABI-L2-SSTP"         # Sea Surface Temperature
+    - "ABI-L2-LSTP"         # Land Surface Temperature
+    - "ABI-L2-MCMIPP"       # Cloud/Moisture Imagery
+    - "ABI-L2-DMWP"         # Derived Motion Winds
+    - "ABI-L2-TPWP"         # Total Precipitable Water
+    - "ABI-L2-ADPP"         # Aerosol Detection Product
+  date_range:
+    start: "2023-06-01"
+    end: "2023-08-31"
+  temporal:
+    window_size: 8
+    forecast_horizon: 4
+    stride: 1
+    interval_hours: 1
+  spatial:
+    target_resolution_km: 10.0
+    grid_size: [256, 256]
+  storage:
+    format: "zarr"
+    root: "data/zarr/"
+  normalization:
+    method: "minmax"        # minmax | zscore | robust
+  missing_data:
+    fill_strategy: "mask"   # mask | interpolate | zero
+
+# ---------------------------------------------------------------------------
+# MODEL — Spatial CNN Encoders
+# ---------------------------------------------------------------------------
+encoder:
+  land:
+    in_channels: 3
+    latent_dim: 128
+    base_filters: 32
+    num_res_blocks: 4
+    attention_layers: [2, 3]
+    dropout: 0.1
+  sea:
+    in_channels: 3
+    latent_dim: 128
+    base_filters: 32
+    num_res_blocks: 4
+    attention_layers: [2, 3]
+    dropout: 0.1
+  cloud:
+    in_channels: 4
+    latent_dim: 128
+    base_filters: 32
+    num_res_blocks: 4
+    attention_layers: [2, 3]
+    dropout: 0.1
+
+# ---------------------------------------------------------------------------
+# MODEL — Temporal Probabilistic Model
+# ---------------------------------------------------------------------------
+temporal:
+  type: "variational_rnn"
+  input_dim: 512
+  hidden_dim: 256
+  latent_dim: 128
+  num_layers: 2
+  num_heads: 8
+  kl_weight: 0.001
+  dropout: 0.15
+  teacher_forcing_ratio: 0.5
+
+# ---------------------------------------------------------------------------
+# MODEL — Reverse Generator (Conditional Decoder)
+# ---------------------------------------------------------------------------
+decoder:
+  type: "unet"
+  in_channels: 128
+  out_channels: 10
+  base_filters: 64
+  depth: 4
+  skip_connections: true
+  activation: "gelu"
+
+# ---------------------------------------------------------------------------
+# MODEL — Fusion Model
+# ---------------------------------------------------------------------------
+fusion:
+  type: "cross_attention"
+  input_sources: 4
+  hidden_dim: 256
+  num_heads: 8
+  num_layers: 3
+  output_dim: 10
+  dropout: 0.1
+
+# ---------------------------------------------------------------------------
+# TRAINING
+# ---------------------------------------------------------------------------
+training:
+  stage_1_encoder:
+    epochs: 50
+    batch_size: 16
+    lr: 1.0e-3
+    weight_decay: 1.0e-5
+    scheduler: "cosine"
+    warmup_epochs: 5
+    loss:
+      mse_weight: 1.0
+      ssim_weight: 0.3
+      physics_weight: 0.1
+  stage_2_temporal:
+    epochs: 80
+    batch_size: 8
+    lr: 5.0e-4
+    weight_decay: 1.0e-5
+    scheduler: "cosine"
+    warmup_epochs: 5
+    freeze_encoders: true
+  stage_3_decoder:
+    epochs: 40
+    batch_size: 8
+    lr: 5.0e-4
+    weight_decay: 1.0e-5
+    scheduler: "step"
+    step_size: 15
+    gamma: 0.5
+  stage_4_fusion:
+    epochs: 60
+    batch_size: 8
+    lr: 3.0e-4
+    weight_decay: 1.0e-5
+    scheduler: "cosine"
+    warmup_epochs: 3
+
+# ---------------------------------------------------------------------------
+# EVALUATION
+# ---------------------------------------------------------------------------
+evaluation:
+  metrics:
+    - "rmse"
+    - "mae"
+    - "ssim"
+    - "crps"
+    - "spatial_correlation"
+  calibration:
+    num_bins: 20
+  multi_step:
+    horizons: [1, 2, 4]
+  save_plots: true
+  plot_dir: "eval_plots/"

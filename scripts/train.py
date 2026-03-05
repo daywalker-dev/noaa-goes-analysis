@@ -1,294 +1,252 @@
 #!/usr/bin/env python
-"""Orchestrate multi-stage training of the GOES forecast pipeline."""
+"""
+train.py — Main entry point for the GOES L2 forecasting pipeline.
+=================================================================
+
+Usage:
+    python -m scripts.train --config configs/default.yaml
+    python -m scripts.train --config configs/default.yaml --stage 2
+    python -m scripts.train --config configs/default.yaml --dry-run
+
+Stages:
+    1  Train spatial CNN encoders (land, sea, cloud)
+    2  Train temporal probabilistic model (encoders frozen)
+    3  Train reverse generator / conditional decoder
+    4  Train fusion model
+
+Pass ``--stage N`` to start from stage N (assumes prior stages are
+checkpointed). Omit ``--stage`` to run all four stages sequentially.
+"""
+
 from __future__ import annotations
 
+import argparse
+import logging
 import sys
 from pathlib import Path
+from typing import Any, Dict
 
-import click
 import torch
-from omegaconf import OmegaConf
 
-from goes_forecast.utils.config_loader import (
-    load_config, validate_config, generate_experiment_id, save_config,
+# ── project imports ──────────────────────────────────────────────────────
+from utils.config import load_config, validate_config, save_config
+from utils.reproducibility import seed_everything, get_device
+
+from models.encoders.spatial_cnn import build_encoder
+from models.temporal.probabilistic import build_temporal_model
+from models.decoder.reverse_generator import build_decoder
+from models.fusion.fusion_model import build_fusion_model
+
+from training.trainer import (
+    train_encoder,
+    train_temporal,
+    train_decoder,
+    train_fusion,
 )
-from goes_forecast.utils.logger import get_logger
-from goes_forecast.utils.reproducibility import set_global_seed, get_environment_info
-from goes_forecast.data.dataset import build_dataloader
-from goes_forecast.models.spatial_encoder import DomainEncoderEnsemble
-from goes_forecast.models.temporal_bayesian import VariationalTransformer
-from goes_forecast.models.reverse_generator import ConditionalUNet
-from goes_forecast.models.fusion import FusionTransformer
-from goes_forecast.training.stage_runners import (
-    EncoderStageRunner, TemporalStageRunner,
-    GeneratorStageRunner, FusionStageRunner,
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s │ %(name)-28s │ %(levelname)-7s │ %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-
-logger = get_logger(__name__)
-
-STAGES = ["encoders", "temporal", "generator", "fusion", "all"]
+logger = logging.getLogger("train")
 
 
-def _get_domain_channels(cfg) -> dict[str, int]:
-    """Count channels per domain from product config."""
-    domain_ch: dict[str, int] = {}
-    for product in cfg.data.products:
-        d = product["domain"]
-        if d == "meteo":
-            continue
-        domain_ch[d] = domain_ch.get(d, 0) + len(product["channels"])
-    return domain_ch
+# ======================================================================
+# Synthetic data generator (for testing / dry-run)
+# ======================================================================
+
+def _make_synthetic_data(cfg: Dict[str, Any]):
+    """
+    Generate synthetic numpy arrays that mimic processed GOES L2 fields.
+    Useful for smoke-testing the full pipeline without real data.
+    """
+    import numpy as np
+    from data.dataset import build_dataloaders
+
+    grid = cfg["data"]["spatial"]["grid_size"]
+    H, W = grid
+    T = 200  # synthetic time-steps
+
+    data_arrays: Dict[str, np.ndarray] = {}
+    masks: Dict[str, np.ndarray] = {}
+
+    # Land surface temperature
+    data_arrays["LST"] = np.random.randn(T, H, W).astype(np.float32) * 5 + 300
+    masks["LST"] = np.ones((T, H, W), dtype=bool)
+
+    # Sea surface temperature
+    data_arrays["SST"] = np.random.randn(T, H, W).astype(np.float32) * 2 + 290
+    masks["SST"] = np.ones((T, H, W), dtype=bool)
+
+    # Cloud / moisture
+    data_arrays["CMI"] = np.random.rand(T, H, W).astype(np.float32)
+    masks["CMI"] = np.ones((T, H, W), dtype=bool)
+
+    # Total precipitable water
+    data_arrays["TPW"] = np.random.rand(T, H, W).astype(np.float32) * 60
+    masks["TPW"] = np.ones((T, H, W), dtype=bool)
+
+    # Derived motion winds
+    data_arrays["wind_speed"] = np.random.rand(T, H, W).astype(np.float32) * 30
+    data_arrays["wind_direction"] = np.random.rand(T, H, W).astype(np.float32) * 360
+    masks["wind_speed"] = np.ones((T, H, W), dtype=bool)
+    masks["wind_direction"] = np.ones((T, H, W), dtype=bool)
+
+    # Inject some missing data
+    for key in data_arrays:
+        miss = np.random.rand(T, H, W) < 0.02
+        data_arrays[key][miss] = np.nan
+        masks[key][miss] = False
+
+    # Fill missing
+    for key in data_arrays:
+        arr = data_arrays[key]
+        arr[~np.isfinite(arr)] = 0.0
+
+    train_dl, val_dl = build_dataloaders(data_arrays, masks, cfg)
+    return train_dl, val_dl
 
 
-def _get_domain_indices(cfg) -> dict[str, list[int]]:
-    """Compute channel index ranges per domain."""
-    indices: dict[str, list[int]] = {}
-    offset = 0
-    for product in cfg.data.products:
-        d = product["domain"]
-        n = len(product["channels"])
-        indices.setdefault(d, []).extend(range(offset, offset + n))
-        offset += n
-    return indices
+# ======================================================================
+# Main
+# ======================================================================
 
+def main() -> None:
+    parser = argparse.ArgumentParser(description="GOES L2 Forecast — Training Pipeline")
+    parser.add_argument("--config", type=str, default="configs/default.yaml",
+                        help="Path to YAML config file")
+    parser.add_argument("--stage", type=int, default=None,
+                        help="Start from this stage (1–4). Default: run all.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Use synthetic data to smoke-test the pipeline")
+    args = parser.parse_args()
 
-def _total_channels(cfg) -> int:
-    return sum(len(p["channels"]) for p in cfg.data.products)
-
-
-def train_encoders(cfg, output_dir, resume=None):
-    logger.info("=== Stage 1: Training Spatial CNN Encoders ===")
-    domain_ch = _get_domain_channels(cfg)
-    domain_idx = _get_domain_indices(cfg)
-
-    model = DomainEncoderEnsemble(domain_ch, cfg.model.encoder)
-    train_loader = build_dataloader(cfg, split="train")
-    val_loader = build_dataloader(cfg, split="val")
-
-    runner = EncoderStageRunner(
-        model, train_loader, val_loader, cfg,
-        output_dir / "encoders", domain_idx,
-    )
-    if resume:
-        runner.load_checkpoint(resume)
-    runner.fit()
-    return model
-
-
-def train_temporal(cfg, encoders, output_dir, resume=None):
-    logger.info("=== Stage 2: Training Variational Transformer ===")
-    domain_idx = _get_domain_indices(cfg)
-    meteo_dim = len(domain_idx.get("meteo", []))
-
-    model = VariationalTransformer(
-        latent_dim=encoders.combined_latent_dim,
-        meteo_dim=max(meteo_dim, 1),
-        state_dim=cfg.model.temporal.state_dim,
-        d_model=cfg.model.temporal.d_model,
-        n_heads=cfg.model.temporal.n_heads,
-        n_encoder_layers=cfg.model.temporal.n_encoder_layers,
-        n_decoder_layers=cfg.model.temporal.n_decoder_layers,
-        dim_feedforward=cfg.model.temporal.dim_feedforward,
-        dropout=cfg.model.temporal.dropout,
-        forecast_steps=cfg.data.temporal.forecast_steps,
-        beta_kl=cfg.model.temporal.beta_kl,
-        free_bits=cfg.model.temporal.free_bits,
-    )
-
-    train_loader = build_dataloader(cfg, split="train")
-    val_loader = build_dataloader(cfg, split="val")
-
-    runner = TemporalStageRunner(
-        model, encoders, train_loader, val_loader, cfg,
-        output_dir / "temporal", domain_idx,
-    )
-    if resume:
-        runner.load_checkpoint(resume)
-    runner.fit()
-    return model
-
-
-def train_generator(cfg, encoders, temporal_model, output_dir, resume=None):
-    logger.info("=== Stage 3: Training Conditional UNet Generator ===")
-    domain_idx = _get_domain_indices(cfg)
-    total_ch = _total_channels(cfg)
-
-    model = ConditionalUNet(
-        state_dim=cfg.model.temporal.state_dim,
-        out_channels=total_ch,
-        noise_dim=cfg.model.generator.noise_dim,
-        base_channels=cfg.model.generator.base_channels,
-        channel_multipliers=list(cfg.model.generator.channel_multipliers),
-        n_res_blocks=cfg.model.generator.n_res_blocks,
-        use_spectral_norm=cfg.model.generator.use_spectral_norm,
-        initial_spatial=tuple(cfg.model.generator.initial_spatial),
-    )
-
-    train_loader = build_dataloader(cfg, split="train")
-    val_loader = build_dataloader(cfg, split="val")
-
-    runner = GeneratorStageRunner(
-        model, encoders, temporal_model,
-        train_loader, val_loader, cfg,
-        output_dir / "generator", domain_idx,
-    )
-    if resume:
-        runner.load_checkpoint(resume)
-    runner.fit()
-    return model
-
-
-def train_fusion(cfg, encoders, temporal_model, generator, output_dir, resume=None):
-    logger.info("=== Stage 4: Training Fusion Transformer ===")
-    domain_idx = _get_domain_indices(cfg)
-    total_ch = _total_channels(cfg)
-    meteo_dim = len(domain_idx.get("meteo", []))
-
-    model = FusionTransformer(
-        cnn_dim=encoders.combined_latent_dim,
-        bayes_dim=cfg.model.temporal.state_dim * 2,
-        meteo_dim=max(meteo_dim, 1),
-        gen_dim=total_ch,
-        d_model=cfg.model.fusion.d_model,
-        n_heads=cfg.model.fusion.n_heads,
-        n_layers=cfg.model.fusion.n_layers,
-        dim_feedforward=cfg.model.fusion.dim_feedforward,
-        dropout=cfg.model.fusion.dropout,
-        out_channels=total_ch,
-        spatial_size=(cfg.data.spatial.patch_size, cfg.data.spatial.patch_size),
-    )
-
-    train_loader = build_dataloader(cfg, split="train")
-    val_loader = build_dataloader(cfg, split="val")
-
-    runner = FusionStageRunner(
-        model, encoders, temporal_model, generator,
-        train_loader, val_loader, cfg,
-        output_dir / "fusion", domain_idx,
-    )
-    if resume:
-        runner.load_checkpoint(resume)
-    runner.fit()
-    return model
-
-
-@click.command()
-@click.option("--stage", type=click.Choice(STAGES), required=True, help="Training stage")
-@click.option("--config", "config_path", required=True, help="Path to config YAML")
-@click.option("--override", multiple=True, help="Config overrides (key=value)")
-@click.option("--resume", default=None, help="Path to checkpoint to resume from")
-def main(stage, config_path, override, resume):
-    # Load and validate config
-    cfg = load_config(config_path, list(override) if override else None)
+    # ── Load config ────────────────────────────────────────────────────
+    cfg = load_config(args.config)
     validate_config(cfg)
+    seed_everything(cfg["project"].get("seed", 42))
+    device = get_device(cfg["project"].get("device", "cuda"))
+    logger.info("Device: %s", device)
 
-    # Setup
-    exp_id = cfg.project.get("experiment_id") or generate_experiment_id(cfg)
-    output_dir = Path(cfg.project.output_dir) / exp_id
-    output_dir.mkdir(parents=True, exist_ok=True)
-    save_config(cfg, output_dir / "config.yaml")
+    # Save a copy of the active config
+    save_config(cfg, Path(cfg["project"]["checkpoint_dir"]) / "config_snapshot.yaml")
 
-    set_global_seed(cfg.project.seed)
-    env_info = get_environment_info()
-    logger.info(f"Experiment: {exp_id}")
-    logger.info(f"Environment: {env_info}")
+    # ── Data ───────────────────────────────────────────────────────────
+    if args.dry_run:
+        logger.info("DRY RUN — using synthetic data")
+        train_dl, val_dl = _make_synthetic_data(cfg)
+    else:
+        # Real data pipeline
+        from data.ingest import (
+            download_all_products,
+            reproject_to_common_grid,
+            align_temporal,
+            FieldNormalizer,
+            fill_missing,
+        )
+        from data.dataset import build_dataloaders
+        import numpy as np
 
-    if stage == "encoders" or stage == "all":
-        encoders = train_encoders(cfg, output_dir, resume if stage == "encoders" else None)
+        logger.info("Downloading GOES L2 products...")
+        raw = download_all_products(cfg)
 
-    if stage == "temporal" or stage == "all":
-        if stage == "temporal":
-            # Load encoders from checkpoint
-            domain_ch = _get_domain_channels(cfg)
-            encoders = DomainEncoderEnsemble(domain_ch, cfg.model.encoder)
-            enc_ckpt = output_dir / "encoders" / "checkpoints" / "best.ckpt"
-            if enc_ckpt.exists():
-                encoders.load_state_dict(torch.load(enc_ckpt, weights_only=False)["state_dict"])
-        temporal_model = train_temporal(cfg, encoders, output_dir, resume if stage == "temporal" else None)
+        logger.info("Reprojecting to common grid...")
+        grid = tuple(cfg["data"]["spatial"]["grid_size"])
+        for prod, ds_list in raw.items():
+            raw[prod] = [reproject_to_common_grid(ds, grid) for ds in ds_list]
 
-    if stage == "generator" or stage == "all":
-        if stage == "generator":
-            domain_ch = _get_domain_channels(cfg)
-            encoders = DomainEncoderEnsemble(domain_ch, cfg.model.encoder)
-            enc_ckpt = output_dir / "encoders" / "checkpoints" / "best.ckpt"
-            if enc_ckpt.exists():
-                encoders.load_state_dict(torch.load(enc_ckpt, weights_only=False)["state_dict"])
+        logger.info("Temporal alignment...")
+        aligned = align_temporal(raw, cfg["data"]["temporal"]["interval_hours"])
 
-            domain_idx = _get_domain_indices(cfg)
-            meteo_dim = len(domain_idx.get("meteo", []))
-            temporal_model = VariationalTransformer(
-                latent_dim=encoders.combined_latent_dim,
-                meteo_dim=max(meteo_dim, 1),
-                state_dim=cfg.model.temporal.state_dim,
-                d_model=cfg.model.temporal.d_model,
-                n_heads=cfg.model.temporal.n_heads,
-                n_encoder_layers=cfg.model.temporal.n_encoder_layers,
-                n_decoder_layers=cfg.model.temporal.n_decoder_layers,
-                dim_feedforward=cfg.model.temporal.dim_feedforward,
-                dropout=cfg.model.temporal.dropout,
-                forecast_steps=cfg.data.temporal.forecast_steps,
-                beta_kl=cfg.model.temporal.beta_kl,
-                free_bits=cfg.model.temporal.free_bits,
+        # Convert to numpy arrays  (T, H, W) per variable
+        data_arrays = {}
+        masks = {}
+        for prod, ds in aligned.items():
+            from data.ingest import PRODUCT_VARIABLE_MAP
+            for var in PRODUCT_VARIABLE_MAP.get(prod, []):
+                if var in ds:
+                    arr = ds[var].values.astype(np.float32)
+                    filled, msk = fill_missing(
+                        arr[:, np.newaxis],
+                        cfg["data"]["missing_data"]["fill_strategy"],
+                    )
+                    data_arrays[var] = filled[:, 0]
+                    masks[var] = msk[:, 0]
+
+        # Normalize
+        normalizer = FieldNormalizer(cfg["data"]["normalization"]["method"])
+        all_data = np.stack(list(data_arrays.values()), axis=1)
+        normalizer.fit(all_data, list(data_arrays.keys()))
+        normed = normalizer.transform(all_data, list(data_arrays.keys()))
+        for i, key in enumerate(data_arrays):
+            data_arrays[key] = normed[:, i]
+
+        train_dl, val_dl = build_dataloaders(data_arrays, masks, cfg)
+
+    # ── Build models ───────────────────────────────────────────────────
+    grid_size = tuple(cfg["data"]["spatial"]["grid_size"])
+    encoders = {
+        "land": build_encoder(cfg["encoder"]["land"]),
+        "sea": build_encoder(cfg["encoder"]["sea"]),
+        "cloud": build_encoder(cfg["encoder"]["cloud"]),
+    }
+    temporal_model = build_temporal_model(cfg["temporal"])
+    decoder = build_decoder(cfg["decoder"], grid_size)
+    fusion_model = build_fusion_model(cfg["fusion"], grid_size)
+
+    start = args.stage or 1
+
+    # ── Stage 1 ─────────────────────────────────────────────────────
+    if start <= 1:
+        logger.info("═══ STAGE 1: Training Spatial Encoders ═══")
+        for name, enc in encoders.items():
+            logger.info("Training encoder: %s", name)
+            encoders[name] = train_encoder(
+                enc, train_dl, val_dl, cfg, device, tag=f"{name}_encoder",
             )
-            temp_ckpt = output_dir / "temporal" / "checkpoints" / "best.ckpt"
-            if temp_ckpt.exists():
-                temporal_model.load_state_dict(torch.load(temp_ckpt, weights_only=False)["state_dict"])
+    else:
+        # Load checkpointed encoders
+        for name, enc in encoders.items():
+            ckpt = Path(cfg["project"]["checkpoint_dir"]) / f"{name}_encoder" / "best.pt"
+            if ckpt.exists():
+                enc.load_state_dict(torch.load(ckpt, weights_only=True))
+                enc.to(device)
+                logger.info("Loaded encoder checkpoint: %s", ckpt)
 
-        generator = train_generator(
-            cfg, encoders, temporal_model, output_dir,
-            resume if stage == "generator" else None,
+    # ── Stage 2 ─────────────────────────────────────────────────────
+    if start <= 2:
+        logger.info("═══ STAGE 2: Training Temporal Model ═══")
+        temporal_model = train_temporal(
+            temporal_model, encoders, train_dl, val_dl, cfg, device,
+        )
+    else:
+        ckpt = Path(cfg["project"]["checkpoint_dir"]) / "temporal" / "best.pt"
+        if ckpt.exists():
+            temporal_model.load_state_dict(torch.load(ckpt, weights_only=True))
+            temporal_model.to(device)
+
+    # ── Stage 3 ─────────────────────────────────────────────────────
+    if start <= 3:
+        logger.info("═══ STAGE 3: Training Reverse Generator ═══")
+        decoder = train_decoder(
+            decoder, temporal_model, encoders, train_dl, val_dl, cfg, device,
+        )
+    else:
+        ckpt = Path(cfg["project"]["checkpoint_dir"]) / "decoder" / "best.pt"
+        if ckpt.exists():
+            decoder.load_state_dict(torch.load(ckpt, weights_only=True))
+            decoder.to(device)
+
+    # ── Stage 4 ─────────────────────────────────────────────────────
+    if start <= 4:
+        logger.info("═══ STAGE 4: Training Fusion Model ═══")
+        fusion_model = train_fusion(
+            fusion_model, decoder, temporal_model, encoders,
+            train_dl, val_dl, cfg, device,
         )
 
-    if stage == "fusion" or stage == "all":
-        if stage == "fusion":
-            # Load all previous models
-            domain_ch = _get_domain_channels(cfg)
-            domain_idx = _get_domain_indices(cfg)
-            meteo_dim = len(domain_idx.get("meteo", []))
-            total_ch = _total_channels(cfg)
-
-            encoders = DomainEncoderEnsemble(domain_ch, cfg.model.encoder)
-            temporal_model = VariationalTransformer(
-                latent_dim=encoders.combined_latent_dim,
-                meteo_dim=max(meteo_dim, 1),
-                state_dim=cfg.model.temporal.state_dim,
-                d_model=cfg.model.temporal.d_model,
-                n_heads=cfg.model.temporal.n_heads,
-                n_encoder_layers=cfg.model.temporal.n_encoder_layers,
-                n_decoder_layers=cfg.model.temporal.n_decoder_layers,
-                dim_feedforward=cfg.model.temporal.dim_feedforward,
-                dropout=cfg.model.temporal.dropout,
-                forecast_steps=cfg.data.temporal.forecast_steps,
-                beta_kl=cfg.model.temporal.beta_kl,
-                free_bits=cfg.model.temporal.free_bits,
-            )
-            generator = ConditionalUNet(
-                state_dim=cfg.model.temporal.state_dim,
-                out_channels=total_ch,
-                noise_dim=cfg.model.generator.noise_dim,
-                base_channels=cfg.model.generator.base_channels,
-                channel_multipliers=list(cfg.model.generator.channel_multipliers),
-                n_res_blocks=cfg.model.generator.n_res_blocks,
-                use_spectral_norm=cfg.model.generator.use_spectral_norm,
-                initial_spatial=tuple(cfg.model.generator.initial_spatial),
-            )
-
-            for name, model, subdir in [
-                ("encoders", encoders, "encoders"),
-                ("temporal", temporal_model, "temporal"),
-                ("generator", generator, "generator"),
-            ]:
-                ckpt = output_dir / subdir / "checkpoints" / "best.ckpt"
-                if ckpt.exists():
-                    model.load_state_dict(torch.load(ckpt, weights_only=False)["state_dict"])
-                    logger.info(f"Loaded {name} from {ckpt}")
-
-        train_fusion(
-            cfg, encoders, temporal_model, generator, output_dir,
-            resume if stage == "fusion" else None,
-        )
-
-    logger.info("Training complete!")
+    logger.info("Training complete.")
 
 
 if __name__ == "__main__":

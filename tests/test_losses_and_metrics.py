@@ -5,11 +5,11 @@ import numpy as np
 import pytest
 import torch
 
-from goes_forecast.training.losses import (
+from training.losses import (
     CRPSLoss, ELBOLoss, MaskedMSE, PhysicsConstraintLoss,
     SSIMLoss, SpectralLoss,
 )
-from goes_forecast.evaluation.metrics import (
+from evaluation.metrics import (
     bias, coverage_score, crps_gaussian, mae, rmse,
     spatial_correlation, ssim_score,
 )

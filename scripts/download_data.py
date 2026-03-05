@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Download GOES L2 products for a date range."""
 import click
-from goes_forecast.utils.logger import get_logger
-from goes_forecast.data.downloader import GOESDownloader
+from utils.logger import get_logger
+from data.downloader import GOESDownloader
 
 logger = get_logger(__name__)
 

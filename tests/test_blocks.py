@@ -2,7 +2,7 @@
 import pytest
 import torch
 
-from goes_forecast.models.blocks import (
+from models.blocks import (
     CBAM, ChannelAttention, DownBlock, FiLM,
     ResidualBlock, SinusoidalPE, SpatialAttention, UpBlock,
 )
