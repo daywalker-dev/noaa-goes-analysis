@@ -153,10 +153,11 @@ The final integration layer. Fuses four distinct prediction streams into a singl
 ## 3. Project Structure
 
 ```
-goes_forecast/
+noaa-goes-analysis/
 ├── README.md                        Architecture overview and quickstart
 ├── requirements.txt                 Python dependencies
 ├── setup.py                         Package installation config
+├── main.py                         Main python file
 │
 ├── config/
 │   ├── base_config.yaml             Master config: data, model, training, eval

@@ -1,3 +1,27 @@
+
+
+Fix the init.py files for the new structure. Update the README. Finally, v
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # GOES-L2 Probabilistic Earth-System Forecasting Framework
 
 Probabilistic atmospheric forecasting from GOES-16/17/18 Level 2 satellite data using a cascaded deep learning pipeline with uncertainty quantification.

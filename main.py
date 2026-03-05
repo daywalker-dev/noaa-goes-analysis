@@ -21,8 +21,8 @@ from pathlib import Path
 # Ensure project root is on PYTHONPATH when run as a script
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from goes_forecast.utils.config import load_config
-from goes_forecast.utils.logging import get_logger
+from utils.config import load_config
+from utils.logging import get_logger
 
 logger = get_logger("main")
 
@@ -35,7 +35,7 @@ VALID_STAGES = ["encoders", "temporal", "decoder", "fusion"]
 
 def cmd_download(args: argparse.Namespace) -> None:
     """Download GOES L2 products for the configured date range."""
-    from goes_forecast.data.ingest import GOESDataIngester
+    from data.ingest import GOESDataIngester
 
     cfg = load_config(args.config)
     logger.info(f"Starting download | satellite=GOES-{cfg.data.goes_satellite}")
@@ -60,8 +60,8 @@ def cmd_download(args: argparse.Namespace) -> None:
 
 def cmd_preprocess(args: argparse.Namespace) -> None:
     """Reproject, normalize, and write aligned Zarr store."""
-    from goes_forecast.data.ingest import GOESDataIngester
-    from goes_forecast.data.preprocess import GOESPreprocessor
+    from data.ingest import GOESDataIngester
+    from data.preprocess import GOESPreprocessor
 
     cfg = load_config(args.config)
     logger.info("Starting preprocessing pipeline")
@@ -97,7 +97,7 @@ def cmd_preprocess(args: argparse.Namespace) -> None:
 def cmd_train(args: argparse.Namespace) -> None:
     """Run a training stage."""
     import torch
-    from goes_forecast.training.trainer import StageTrainer
+    from training.trainer import StageTrainer
 
     cfg = load_config(args.config)
     stage = args.stage
@@ -133,7 +133,7 @@ def cmd_train(args: argparse.Namespace) -> None:
 def cmd_evaluate(args: argparse.Namespace) -> None:
     """Evaluate a trained model checkpoint on the test split."""
     import torch
-    from goes_forecast.evaluation.evaluator import Evaluator
+    from evaluation.evaluator import Evaluator
 
     cfg = load_config(args.config)
     device = _resolve_device(cfg.project.device)
@@ -158,7 +158,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
 def cmd_forecast(args: argparse.Namespace) -> None:
     """Run inference and produce forecast outputs."""
     import torch
-    from goes_forecast.evaluation.evaluator import Evaluator
+    from evaluation.evaluator import Evaluator
 
     cfg = load_config(args.config)
     device = _resolve_device(cfg.project.device)
