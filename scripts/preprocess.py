@@ -1,5 +1,8 @@
 #!/usr/bin/env python
-"""Run the full preprocessing pipeline: raw NetCDF → Zarr store."""
+"""Run the full preprocessing pipeline: raw NetCDF → Zarr store.
+
+After writing to Zarr, optionally deletes raw NetCDF files to save disk.
+"""
 import click
 from pathlib import Path
 from utils.config_loader import load_config
@@ -13,7 +16,8 @@ logger = get_logger(__name__)
 @click.option("--input", "input_dir", required=True, help="Input directory with raw NetCDF files")
 @click.option("--output", required=True, help="Output Zarr store path")
 @click.option("--config", "config_path", required=True, help="Path to config YAML")
-def main(input_dir, output, config_path):
+@click.option("--cleanup/--no-cleanup", default=True, help="Delete raw files after processing (default: yes)")
+def main(input_dir, output, config_path, cleanup):
     cfg = load_config(config_path)
     logger.info(f"Preprocessing {input_dir} → {output}")
 
@@ -23,12 +27,15 @@ def main(input_dir, output, config_path):
     # Process each product
     all_data = []
     channel_names = []
+    processed_files = []
+
     for product in cfg.data.products:
-        pid = product["id"]
-        shortname = pid.split("-")[-1].replace("F", "")
+        pid = product["id"] if isinstance(product, dict) else product
+        shortname = pid.split("-")[-1].replace("F", "").replace("P", "")
         product_dir = input_path / shortname
         if not product_dir.exists():
-            if product.get("required", True):
+            required = product.get("required", True) if isinstance(product, dict) else True
+            if required:
                 logger.warning(f"Required product dir missing: {product_dir}")
             continue
 
@@ -39,14 +46,16 @@ def main(input_dir, output, config_path):
         results = preprocessor.process_files(files, pid)
         for r in results:
             all_data.append(r["data"])
-        channel_names.extend(product["channels"])
+        processed_files.extend(files)
+
+        if isinstance(product, dict) and "channels" in product:
+            channel_names.extend(product["channels"])
 
     if not all_data:
         logger.error("No data processed. Check input directory.")
         return
 
     import numpy as np
-    # Stack along time dimension — simplified: treat each processed result as one timestep
     data = np.stack(all_data, axis=0)  # (T, C, H, W)
     times = np.arange(data.shape[0]).astype("datetime64[h]") + np.datetime64("2023-01-01")
 
@@ -55,6 +64,17 @@ def main(input_dir, output, config_path):
     })
     preprocessor.write_zarr(output, data, channel_names, times, stats)
     logger.info("Preprocessing complete")
+
+    # Clean up raw files to save disk
+    if cleanup:
+        freed = 0
+        for f in processed_files:
+            try:
+                freed += f.stat().st_size
+                f.unlink()
+            except OSError as e:
+                logger.warning(f"Failed to delete {f}: {e}")
+        logger.info(f"Cleaned up raw files: freed {freed / 1e6:.1f} MB")
 
 
 if __name__ == "__main__":
